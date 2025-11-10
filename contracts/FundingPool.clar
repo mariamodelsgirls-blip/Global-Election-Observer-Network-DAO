@@ -1,0 +1,148 @@
+;; FundingPool.clar
+
+(define-constant ERR-UNAUTHORIZED u100)
+(define-constant ERR-MISSION-NOT-FUNDED u101)
+(define-constant ERR-INSUFFICIENT-BALANCE u102)
+(define-constant ERR-ALREADY-CONTRIBUTED u103)
+(define-constant ERR-MIN-CONTRIBUTION u104)
+(define-constant ERR-WITHDRAW-FAILED u105)
+(define-constant ERR-MISSION-COMPLETED u106)
+(define-constant ERR-INVALID-AMOUNT u107)
+(define-constant ERR-POOL-CLOSED u108)
+(define-constant ERR-EMERGENCY-MODE u109)
+
+(define-data-var pool-active bool true)
+(define-data-var emergency-mode bool false)
+(define-data-var min-contribution uint u1000000)
+(define-data-var treasury principal tx-sender)
+(define-data-var total-collected uint u0)
+(define-data-var total-distributed uint u0)
+
+(define-map contributions { mission-id: uint, contributor: principal } uint)
+(define-map mission-balances uint uint)
+(define-map withdrawn-records { mission-id: uint, contributor: principal } bool)
+
+(define-read-only (get-pool-status)
+  (ok {
+    active: (var-get pool-active),
+    emergency: (var-get emergency-mode),
+    total-collected: (var-get total-collected),
+    total-distributed: (var-get total-distributed),
+    min-contribution: (var-get min-contribution),
+    treasury: (var-get treasury)
+  })
+)
+
+(define-read-only (get-contribution (mission-id uint) (contributor principal))
+  (default-to u0 (map-get? contributions { mission-id: mission-id, contributor: contributor }))
+)
+
+(define-read-only (get-mission-balance (mission-id uint))
+  (default-to u0 (map-get? mission-balances mission-id))
+)
+
+(define-read-only (has-withdrawn (mission-id uint) (contributor principal))
+  (default-to false (map-get? withdrawn-records { mission-id: mission-id, contributor: contributor }))
+)
+
+(define-public (contribute (mission-id uint) (amount uint))
+  (let ((current-balance (get-mission-balance mission-id))
+        (existing-contrib (get-contribution mission-id tx-sender)))
+    (asserts! (var-get pool-active) (err ERR-POOL-CLOSED))
+    (asserts! (not (var-get emergency-mode)) (err ERR-EMERGENCY-MODE))
+    (asserts! (>= amount (var-get min-contribution)) (err ERR-MIN-CONTRIBUTION))
+    (asserts! (> amount u0) (err ERR-INVALID-AMOUNT))
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set contributions
+      { mission-id: mission-id, contributor: tx-sender }
+      (+ existing-contrib amount)
+    )
+    (map-set mission-balances mission-id (+ current-balance amount))
+    (var-set total-collected (+ (var-get total-collected) amount))
+    (print { event: "contribution", mission-id: mission-id, contributor: tx-sender, amount: amount })
+    (ok true)
+  )
+)
+
+(define-public (withdraw-contribution (mission-id uint))
+  (let ((contrib-amount (get-contribution mission-id tx-sender))
+        (mission-balance (get-mission-balance mission-id)))
+    (asserts! (> contrib-amount u0) (err ERR-INSUFFICIENT-BALANCE))
+    (asserts! (not (has-withdrawn mission-id tx-sender)) (err ERR-ALREADY-CONTRIBUTED))
+    (asserts! (var-get pool-active) (err ERR-POOL-CLOSED))
+    (map-set withdrawn-records { mission-id: mission-id, contributor: tx-sender } true)
+    (map-set contributions { mission-id: mission-id, contributor: tx-sender } u0)
+    (map-set mission-balances mission-id (- mission-balance contrib-amount))
+    (var-set total-collected (- (var-get total-collected) contrib-amount))
+    (as-contract (try! (stx-transfer? contrib-amount tx-sender tx-sender)))
+    (print { event: "withdrawal", mission-id: mission-id, contributor: tx-sender, amount: contrib-amount })
+    (ok contrib-amount)
+  )
+)
+
+(define-public (distribute-to-mission (mission-id uint) (amount uint))
+  (let ((mission-balance (get-mission-balance mission-id)))
+    (asserts! (is-eq tx-sender (var-get treasury)) (err ERR-UNAUTHORIZED))
+    (asserts! (>= mission-balance amount) (err ERR-INSUFFICIENT-BALANCE))
+    (asserts! (var-get pool-active) (err ERR-POOL-CLOSED))
+    (map-set mission-balances mission-id (- mission-balance amount))
+    (var-set total-distributed (+ (var-get total-distributed) amount))
+    (as-contract (try! (stx-transfer? amount tx-sender (contract-call? .mission-manager get-mission mission-id proposer))))
+    (print { event: "distribution", mission-id: mission-id, amount: amount })
+    (ok true)
+  )
+)
+
+(define-public (emergency-withdraw-all (to principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get treasury)) (err ERR-UNAUTHORIZED))
+    (var-set emergency-mode true)
+    (var-set pool-active false)
+    (let ((balance (stx-get-balance (as-contract tx-sender))))
+      (as-contract (try! (stx-transfer? balance tx-sender to)))
+      (print { event: "emergency-withdraw", amount: balance, to: to })
+      (ok balance)
+    )
+  )
+)
+
+(define-public (toggle-pool-active (active bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get treasury)) (err ERR-UNAUTHORIZED))
+    (var-set pool-active active)
+    (ok true)
+  )
+)
+
+(define-public (update-min-contribution (new-min uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get treasury)) (err ERR-UNAUTHORIZED))
+    (asserts! (> new-min u0) (err ERR-INVALID-AMOUNT))
+    (var-set min-contribution new-min)
+    (ok true)
+  )
+)
+
+(define-public (transfer-treasury-role (new-treasury principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get treasury)) (err ERR-UNAUTHORIZED))
+    (var-set treasury new-treasury)
+    (print { event: "treasury-transferred", new-treasury: new-treasury })
+    (ok true)
+  )
+)
+
+(define-public (claim-refund-if-mission-failed (mission-id uint))
+  (let ((mission (contract-call? .mission-manager get-mission mission-id))
+        (contrib (get-contribution mission-id tx-sender)))
+    (asserts! (is-some mission) (err ERR-MISSION-NOT-FOUND))
+    (asserts! (is-eq (get status (unwrap! mission (err ERR-MISSION-NOT-FOUND))) "rejected") (err ERR-MISSION-COMPLETED))
+    (asserts! (> contrib u0) (err ERR-INSUFFICIENT-BALANCE))
+    (asserts! (not (has-withdrawn mission-id tx-sender)) (err ERR-ALREADY-CONTRIBUTED))
+    (map-set withdrawn-records { mission-id: mission-id, contributor: tx-sender } true)
+    (map-set contributions { mission-id: mission-id, contributor: tx-sender } u0)
+    (map-set mission-balances mission-id (- (get-mission-balance mission-id) contrib))
+    (as-contract (try! (stx-transfer? contrib tx-sender tx-sender)))
+    (ok contrib)
+  )
+)
